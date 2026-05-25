@@ -1,35 +1,30 @@
 """
-Joint Source-Target SL-RFM (JST-SLRFM) for SCLC SLI discovery.
+JST-PCC dual boost: SCLC-primary score with two additive structural boosts.
 
-Single unified method (all knockouts / panels):
-  1. Source:     joint unweighted KRR on pan -> alpha_0
-  2. Alignment:  KMM row weights omega toward SCLC target distribution
-  3. Transfer:   joint weighted KRR with P_pan and ridge prior to alpha_0
-                 (K_w + (REG+gamma)I) alpha* = Y_w + gamma * alpha_0
-  4. Structure:  AGOP(alpha*) only (no PCC in structural channel)
-  5. Context:    importance-weighted PCC on all pan lines with omega
-  6. Score:      S = structure * context
+  S = C_sclc * (1 + lam1 * max(0, z(transfer_AGOP)) + lam2 * max(0, z(pan_FI)))
 
-Baselines (same evaluation): pan_fi, hybrid_pan_fi_x_sclc_pcc, sclc_pcc_only.
+  transfer_AGOP — AGOP(alpha*) from JST transfer (KMM weights + P_pan + gamma prior)
+  pan_FI        — standard pan SL-RFM: AGOP(alpha_0) x PCC on pan lines (same as pan_fi baseline)
 
-Does not use per-KO transfer, tiered 100/10/1 weights, or hybrid-style double PCC.
+lam1=lam2=0  =>  sclc_pcc_only.
+
+Standalone pipeline. Run: python sli_jst_pcc_dual_pipeline.py
 """
 
 from __future__ import annotations
 
 import os
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import hickle as hkl
 import numpy as np
 import pandas as pd
 import torch
 from numpy.linalg import norm
-from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
-# Paths
+# Paths & config
 # ---------------------------------------------------------------------------
 PAN_EMBED_HKL = "embeddings/final_X_tcga_processed.hkl"
 PAN_GENE_EFFECT_HKL = "datasets/2023/CRISPRGeneEffect_processed.hkl"
@@ -38,7 +33,7 @@ SCLC_GENE_EFFECT_HKL = "datasets/2023/CRISPRGeneEffect_sclc_processed.hkl"
 FEATURE_IMPORTANCE_PAN_PREFIX = "datasets/feature_importances_pan"
 MODEL_CSV_PATH = "datasets/2023/Model.csv"
 
-RESULTS_DIR = "sli_jst_results"
+RESULTS_DIR = "sli_jst_pcc_dual_results"
 
 BANDWIDTH = 1.0
 REG = 1e-5
@@ -46,22 +41,31 @@ L_GRAD = 1.0
 P_CLIP_LOW = 0.5
 P_CLIP_HIGH = 2.0
 
-# KMM: match weighted mean embedding to target mixture, then clip weights
 KMM_W_MIN = 0.1
 KMM_W_MAX = 10.0
 KMM_N_ITER = 25
-KMM_TARGET_SCLC_FRAC = 1.0  # 1.0 = SCLC-only target; <1 mixes lung NSCLC into target mean
+KMM_TARGET_SCLC_FRAC = 1.0
 
-# Pan-prior strength (one global gamma for all panels; sweep on validation)
-JST_GAMMA_SWEEP: List[float] = [0.0,
-                                0.01, 0.05, 0.1,
-                                0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45,
-                                0.5, 0.6, 0.75,
-                                1.0,
-                            ]
+# Best-performing gammas from single-boost sweep; expand if needed.
+JST_GAMMA_SWEEP: List[float] = [1.0, 10.0]
 DEFAULT_JST_GAMMA = 1.0
 
-JST_COMPUTE_ALL_KOS = False
+# Transfer boost (lam1): fine grid around single-boost optimum (~0.5).
+LAM1_SWEEP: List[float] = [
+    0.0,
+    0.01, 0.05, 0.1,
+    0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45,
+    0.5, 0.6, 0.75,
+    1.0,
+]
+
+# Pan-FI boost (lam2): keep small; large values tend to behave like hybrid product.
+LAM2_SWEEP: List[float] = [0.0, 0.01, 0.05, 0.1, 0.2, 0.5]
+
+DEFAULT_LAM1 = 0.5
+DEFAULT_LAM2 = 0.1
+
+COMPUTE_ALL_KOS = False
 
 KNOWN_SLI_PANELS = [
     ("ASCL1-ASCL1", "ASCL1", "ASCL1"),
@@ -82,7 +86,7 @@ KNOWN_SLI_PANELS = [
 
 
 # ---------------------------------------------------------------------------
-# I/O
+# I/O (shared with sli_jst_pcc_pipeline.py)
 # ---------------------------------------------------------------------------
 def as_dataframe(obj: object, name: str = "data") -> pd.DataFrame:
     if isinstance(obj, pd.DataFrame):
@@ -215,12 +219,12 @@ def print_dataset_diagnostics(
 
 
 # ---------------------------------------------------------------------------
-# Kernel / KRR
+# Kernel / KRR / AGOP
 # ---------------------------------------------------------------------------
 def euclidean_distances_torch(
     samples: torch.Tensor,
     centers: torch.Tensor,
-    M: Optional[torch.Tensor] = None,
+    M: torch.Tensor | None = None,
     squared: bool = True,
     diag_only: bool = False,
 ) -> torch.Tensor:
@@ -254,8 +258,8 @@ def build_kernel_matrix(
     X_t: torch.Tensor,
     bandwidth: float,
     device: torch.device,
-    sample_weights: Optional[np.ndarray] = None,
-    P: Optional[np.ndarray] = None,
+    sample_weights: np.ndarray | None = None,
+    P: np.ndarray | None = None,
 ) -> torch.Tensor:
     P_t = torch.tensor(P, device=device).double() if P is not None else None
     dist = euclidean_distances_torch(X_t, X_t, M=P_t, squared=False, diag_only=True)
@@ -273,25 +277,20 @@ def train_krr_joint(
     device: torch.device,
     bandwidth: float = BANDWIDTH,
     reg: float = REG,
-    sample_weights: Optional[np.ndarray] = None,
-    P: Optional[np.ndarray] = None,
-    alpha_prior: Optional[np.ndarray] = None,
+    sample_weights: np.ndarray | None = None,
+    P: np.ndarray | None = None,
+    alpha_prior: np.ndarray | None = None,
     gamma: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Joint KRR for all KO columns.
-
-    With gamma > 0 and alpha_prior: (K_w + (reg+gamma)I) alpha = Y_w + gamma * alpha_prior.
-    """
     X_t = torch.tensor(cell_embedding_df.values, device=device).float()
     Y_t = torch.tensor(gene_effects_df.values, device=device).float()
-    n = X_t.shape[0]
 
     K = build_kernel_matrix(X_t, bandwidth, device, sample_weights, P)
     if sample_weights is not None:
         scale = torch.tensor(np.sqrt(sample_weights), device=device).float()
         Y_t = scale.unsqueeze(1) * Y_t
 
+    n = K.shape[0]
     I = torch.eye(n, device=device)
     if alpha_prior is not None and gamma > 0:
         a_p = torch.tensor(alpha_prior, device=device).float()
@@ -305,7 +304,7 @@ def laplace_kernel(
     samples: torch.Tensor,
     centers: torch.Tensor,
     bandwidth: float,
-    M: Optional[torch.Tensor] = None,
+    M: torch.Tensor | None = None,
     diag_only: bool = False,
 ) -> torch.Tensor:
     kernel_mat = euclidean_distances_torch(
@@ -371,34 +370,6 @@ def get_pcc(
     return pd.DataFrame(pcc, index=norm_emb.columns, columns=norm_ge.columns)
 
 
-def get_pcc_weighted(
-    cell_embedding: pd.DataFrame,
-    gene_effects_df: pd.DataFrame,
-    sample_weights: np.ndarray,
-) -> pd.DataFrame:
-    """Weighted Pearson: features (rows) x KO columns."""
-    emb = _embedding_with_exp_outlier_mask(cell_embedding)
-    w = np.asarray(sample_weights, dtype=float)
-    w = w / w.sum()
-    X = emb.values
-    Y = gene_effects_df.values
-    n, _ = X.shape
-    if len(w) != n:
-        raise ValueError("sample_weights length must match number of cell lines.")
-
-    mu_x = (w[:, None] * X).sum(axis=0)
-    mu_y = (w[:, None] * Y).sum(axis=0)
-    Xc = X - mu_x
-    Yc = Y - mu_y
-    cov = Xc.T @ (w[:, None] * Yc)
-    var_x = (w[:, None] * Xc**2).sum(axis=0)
-    var_y = (w[:, None] * Yc**2).sum(axis=0)
-    denom = np.sqrt(var_x).reshape(-1, 1) * np.sqrt(var_y).reshape(1, -1)
-    denom = np.where(denom == 0, np.nan, denom)
-    pcc = cov / denom
-    return pd.DataFrame(pcc, index=emb.columns, columns=gene_effects_df.columns)
-
-
 def process_pcc_for_sli(pcc: pd.DataFrame) -> pd.DataFrame:
     out = pcc.copy().fillna(0)
     mut = [x for x in out.index if x.split("_")[-1] != "exp"]
@@ -416,7 +387,7 @@ def stabilize_metric_p(p: pd.Series) -> pd.Series:
 
 
 # ---------------------------------------------------------------------------
-# KMM row weights (linear mean matching + clip)
+# KMM weights
 # ---------------------------------------------------------------------------
 def compute_target_centroid(
     X: np.ndarray,
@@ -440,10 +411,6 @@ def compute_kmm_weights(
     w_max: float = KMM_W_MAX,
     n_iter: int = KMM_N_ITER,
 ) -> np.ndarray:
-    """
-    Align weighted training mean in embedding space to target centroid (KMM-style).
-    Returns omega with sum(omega) = n_lines.
-    """
     X = pan_embedding.values.astype(float)
     n = X.shape[0]
     index = pan_embedding.index
@@ -464,33 +431,29 @@ def compute_kmm_weights(
         mu_w = np.average(X, axis=0, weights=omega)
         residual = mu_w - mu_target
         scale = float(np.linalg.norm(residual)) + 1e-8
-        adjust = np.exp(-0.5 * (np.linalg.norm(X - mu_target, axis=1) / (sigma + 0.25 * scale)) ** 2)
+        adjust = np.exp(
+            -0.5 * (np.linalg.norm(X - mu_target, axis=1) / (sigma + 0.25 * scale)) ** 2
+        )
         omega = omega * adjust
         omega = np.clip(omega, w_min, w_max)
         omega = omega * n / omega.sum()
 
-    n_s = len(sclc_idx)
-    n_l = len(lung_idx)
     print(
-        f"  KMM weights (target SCLC frac={sclc_frac:.2f}): "
-        f"sum={omega.sum():.1f}, mean={omega.mean():.3f}, "
-        f"SCLC mean w={omega[sclc_idx].mean():.3f} ({n_s} lines), "
-        f"lung mean w={omega[lung_idx].mean():.3f} ({n_l} lines) "
-        f"if lung present"
+        f"  KMM weights: sum={omega.sum():.1f}, SCLC mean={omega[sclc_idx].mean():.3f} "
+        f"({len(sclc_idx)} lines)"
     )
     return omega
 
 
 # ---------------------------------------------------------------------------
-# P_pan and pan FI (baseline)
+# Structure channels & dual-boost score
 # ---------------------------------------------------------------------------
 def load_or_compute_p_pan(
     pan_embedding: pd.DataFrame,
     pan_effects: pd.DataFrame,
     device: torch.device,
-    results_dir: str = RESULTS_DIR,
 ) -> pd.Series:
-    for subdir in (results_dir, "sli_transfer_results"):
+    for subdir in (RESULTS_DIR, "sli_jst_pcc_results", "sli_jst_results", "sli_transfer_results"):
         csv_path = os.path.join(subdir, "P_pan.csv")
         if os.path.exists(csv_path):
             print(f"Loading cached P_pan from {csv_path}")
@@ -498,17 +461,14 @@ def load_or_compute_p_pan(
             return p_pan.reindex(pan_embedding.columns).fillna(1.0)
 
     print("Computing P_pan from pan AGOP...")
-    alpha0, X_t = train_krr_joint(
-        pan_embedding, pan_effects, device, P=None, gamma=0.0
-    )
+    alpha0, X_t = train_krr_joint(pan_embedding, pan_effects, device, P=None, gamma=0.0)
     P_ones = torch.ones(X_t.shape[1], device=device).double()
     grads = get_grads(X_t, alpha0.T, P=P_ones)
     p_pan = stabilize_metric_p(
         pd.Series(grads.detach().cpu().numpy().mean(axis=1), index=pan_embedding.columns)
     )
-    os.makedirs(results_dir, exist_ok=True)
-    p_pan.to_csv(os.path.join(results_dir, "P_pan.csv"))
-    np.save(os.path.join(results_dir, "P_pan.npy"), p_pan.values)
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    p_pan.to_csv(os.path.join(RESULTS_DIR, "P_pan.csv"))
     return p_pan
 
 
@@ -535,33 +495,22 @@ def compute_pan_fi(
     return grads_df * pcc
 
 
-# ---------------------------------------------------------------------------
-# JST-SLRFM (primary)
-# ---------------------------------------------------------------------------
-def compute_jst_slrfm(
+def compute_jst_structure(
     pan_embedding: pd.DataFrame,
     pan_effects: pd.DataFrame,
     device: torch.device,
     p_pan_values: np.ndarray,
     omega: np.ndarray,
     gamma: float,
-    ko_columns: Optional[List[str]] = None,
 ) -> pd.DataFrame:
-    """
-    Joint source-target SL-RFM: AGOP(alpha*) * PCC_omega (separate channels).
-    """
-    effects = pan_effects if ko_columns is None else pan_effects.loc[:, ko_columns]
-
     print(f"  JST source KRR (joint, unweighted)...")
-    alpha0, X_t = train_krr_joint(
-        pan_embedding, effects, device, P=None, gamma=0.0
-    )
+    alpha0, X_t = train_krr_joint(pan_embedding, pan_effects, device, P=None, gamma=0.0)
     alpha0_np = alpha0.detach().cpu().numpy()
 
-    print(f"  JST transfer KRR (joint, KMM weights, gamma={gamma})...")
+    print(f"  JST transfer KRR (KMM weights, gamma={gamma})...")
     alpha_star, _ = train_krr_joint(
         pan_embedding,
-        effects,
+        pan_effects,
         device,
         sample_weights=omega,
         P=p_pan_values,
@@ -571,26 +520,50 @@ def compute_jst_slrfm(
 
     P_t = torch.tensor(p_pan_values, device=device).double()
     structure = get_grads(X_t, alpha_star.T, P=P_t)
-    structure_df = pd.DataFrame(
+    return pd.DataFrame(
         structure.cpu().numpy(),
         index=pan_embedding.columns,
-        columns=effects.columns,
+        columns=pan_effects.columns,
     )
 
-    context = process_pcc_for_sli(
-        get_pcc_weighted(pan_embedding, effects, omega)
-    )
-    context = context.reindex(index=structure_df.index, columns=structure_df.columns).fillna(0)
 
-    return structure_df * context
+def zscore_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.astype(float).copy()
+    for col in out.columns:
+        s = out[col]
+        std = float(s.std())
+        out[col] = (s - s.mean()) / std if std > 0 else 0.0
+    return out
 
 
-def jst_method_tag(gamma: float) -> str:
-    return f"jst_kmm_g{gamma:g}"
+def compute_jst_pcc_dual_scores(
+    pcc_sclc: pd.DataFrame,
+    structure_transfer: pd.DataFrame,
+    pan_fi: pd.DataFrame,
+    lam1: float,
+    lam2: float,
+) -> pd.DataFrame:
+    """
+    S = C_sclc * (1 + lam1*max(0,z_transfer) + lam2*max(0,z_pan_fi)).
+    lam1=lam2=0 => sclc_pcc only.
+    """
+    z_transfer = zscore_columns(structure_transfer)
+    z_pan = zscore_columns(pan_fi)
+    boost = 1.0 + lam1 * z_transfer.clip(lower=0) + lam2 * z_pan.clip(lower=0)
+
+    common_idx = pcc_sclc.index.intersection(boost.index)
+    common_cols = pcc_sclc.columns.intersection(boost.columns)
+    pcc = pcc_sclc.loc[common_idx, common_cols].fillna(0)
+    b = boost.loc[common_idx, common_cols].fillna(1.0)
+    return pcc * b
+
+
+def method_tag(gamma: float, lam1: float, lam2: float) -> str:
+    return f"jst_dual_g{gamma:g}_l1{lam1:g}_l2{lam2:g}"
 
 
 # ---------------------------------------------------------------------------
-# Baselines
+# Baselines & evaluation
 # ---------------------------------------------------------------------------
 def hybrid_score_for_ko(
     fi_pan: pd.DataFrame, pcc_sclc: pd.DataFrame, ko_gene: str
@@ -606,15 +579,11 @@ def hybrid_score_for_ko(
 def build_hybrid_fi(
     fi_pan: pd.DataFrame, pcc_sclc: pd.DataFrame, ko_columns: List[str]
 ) -> pd.DataFrame:
-    cols = {}
-    for ko in ko_columns:
-        cols[ko] = hybrid_score_for_ko(fi_pan, pcc_sclc, ko)
-    return pd.DataFrame(cols)
+    return pd.DataFrame(
+        {ko: hybrid_score_for_ko(fi_pan, pcc_sclc, ko) for ko in ko_columns}
+    )
 
 
-# ---------------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------------
 def rank_all_features_for_one_ko(scores: pd.Series, ko_gene: str) -> pd.DataFrame:
     s = scores.sort_values(ascending=False)
     df = s.reset_index()
@@ -678,13 +647,12 @@ def mean_panel_rank(eval_df: pd.DataFrame, method: str) -> float:
     return float(sub.mean()) if len(sub) else float("nan")
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def main() -> None:
     os.makedirs(RESULTS_DIR, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    print(f"Results: {RESULTS_DIR}/")
+    print(f"Dual boost sweep: {len(JST_GAMMA_SWEEP)} gamma x {len(LAM1_SWEEP)} lam1 x {len(LAM2_SWEEP)} lam2")
 
     pan_embedding = ensure_row_l2_normalized(load_hkl_dataframe(PAN_EMBED_HKL, "pan"))
     pan_effects = load_hkl_dataframe(PAN_GENE_EFFECT_HKL, "pan_effects")
@@ -705,10 +673,7 @@ def main() -> None:
     p_pan_values = p_pan.values
 
     print("\n=== KMM target alignment weights ===")
-    omega = compute_kmm_weights(
-        pan_embedding, sclc_in_pan, lung_in_pan, sclc_frac=KMM_TARGET_SCLC_FRAC
-    )
-    np.save(os.path.join(RESULTS_DIR, "kmm_omega.npy"), omega)
+    omega = compute_kmm_weights(pan_embedding, sclc_in_pan, lung_in_pan)
     pd.Series(omega, index=pan_embedding.index).to_csv(
         os.path.join(RESULTS_DIR, "kmm_omega.csv")
     )
@@ -716,58 +681,64 @@ def main() -> None:
     pcc_sclc = process_pcc_for_sli(get_pcc(sclc_embedding, sclc_effects))
 
     panel_kos = sorted({ko for _, ko, _ in KNOWN_SLI_PANELS})
-    eval_kos = list(pan_effects.columns) if JST_COMPUTE_ALL_KOS else panel_kos
+    eval_kos = list(pan_effects.columns) if COMPUTE_ALL_KOS else panel_kos
+    pcc_sclc_eval = pcc_sclc.loc[:, eval_kos]
+    pan_effects_eval = pan_effects.loc[:, eval_kos]
 
     eval_rows: List[pd.DataFrame] = []
 
-    print("\n=== Baseline: pan_fi ===")
-    fi_pan = compute_pan_fi(pan_embedding, pan_effects.loc[:, eval_kos], device)
+    print("\n=== Baselines ===")
+    fi_pan = compute_pan_fi(pan_embedding, pan_effects_eval, device)
     eval_rows.append(evaluate_panel(fi_pan, "pan_fi"))
+    eval_rows.append(evaluate_panel(build_hybrid_fi(fi_pan, pcc_sclc, eval_kos), "hybrid_pan_fi_x_sclc_pcc"))
+    eval_rows.append(evaluate_panel(pcc_sclc_eval, "sclc_pcc_only"))
 
-    print("\n=== Baseline: hybrid (pan FI x |SCLC PCC|) ===")
-    fi_hybrid = build_hybrid_fi(fi_pan, pcc_sclc, eval_kos)
-    eval_rows.append(evaluate_panel(fi_hybrid, "hybrid_pan_fi_x_sclc_pcc"))
+    print("\n=== Pan FI channel (lam2 source, computed once) ===")
+    pan_fi_eval = fi_pan.reindex(index=pcc_sclc_eval.index, columns=eval_kos).fillna(0)
 
-    print("\n=== Baseline: sclc_pcc_only ===")
-    eval_rows.append(evaluate_panel(pcc_sclc.loc[:, eval_kos], "sclc_pcc_only"))
+    structure_by_gamma: Dict[float, pd.DataFrame] = {}
+    fi_by_tag: Dict[str, pd.DataFrame] = {}
 
-    fi_by_gamma: Dict[str, pd.DataFrame] = {}
     for gamma in JST_GAMMA_SWEEP:
-        tag = jst_method_tag(gamma)
-        print(f"\n=== Primary: JST-SLRFM ({tag}) ===")
-        fi_jst = compute_jst_slrfm(
+        print(f"\n=== JST transfer structure (gamma={gamma}) ===")
+        structure_by_gamma[gamma] = compute_jst_structure(
             pan_embedding,
-            pan_effects,
+            pan_effects_eval,
             device,
             p_pan_values,
             omega,
-            gamma=gamma,
-            ko_columns=eval_kos,
+            gamma,
         )
-        fi_by_gamma[tag] = fi_jst
-        eval_rows.append(evaluate_panel(fi_jst, tag))
+
+    print("\n=== Primary: JST-PCC dual boost ===")
+    for gamma in JST_GAMMA_SWEEP:
+        structure = structure_by_gamma[gamma]
+        for lam1 in LAM1_SWEEP:
+            for lam2 in LAM2_SWEEP:
+                tag = method_tag(gamma, lam1, lam2)
+                fi = compute_jst_pcc_dual_scores(
+                    pcc_sclc_eval, structure, pan_fi_eval, lam1, lam2
+                )
+                fi_by_tag[tag] = fi
+                eval_rows.append(evaluate_panel(fi, tag))
 
     eval_df = pd.concat(eval_rows, ignore_index=True)
     eval_csv = os.path.join(RESULTS_DIR, "panel_rank_comparison.csv")
     eval_df.to_csv(eval_csv, index=False)
 
-    rank_summary = []
-    for method in eval_df["method"].unique():
-        rank_summary.append(
-            {"method": method, "mean_panel_rank": mean_panel_rank(eval_df, method)}
-        )
+    rank_summary = [
+        {"method": m, "mean_panel_rank": mean_panel_rank(eval_df, m)}
+        for m in eval_df["method"].unique()
+    ]
     rank_summary_df = pd.DataFrame(rank_summary).sort_values("mean_panel_rank")
     rank_summary_df.to_csv(os.path.join(RESULTS_DIR, "mean_panel_rank.csv"), index=False)
 
-    best_gamma_tag = rank_summary_df.iloc[0]["method"]
-    if best_gamma_tag.startswith("jst_"):
-        print(f"\nBest JST gamma by mean panel rank: {best_gamma_tag}")
-    else:
-        jst_only = rank_summary_df[rank_summary_df["method"].str.startswith("jst_")]
-        if len(jst_only):
-            print(f"\nBest JST gamma by mean panel rank: {jst_only.iloc[0]['method']}")
-        else:
-            print("\nNo JST config in rank summary.")
+    dual_rows = rank_summary_df[rank_summary_df["method"].str.startswith("jst_dual_")]
+    if len(dual_rows):
+        print(f"\nBest dual boost: {dual_rows.iloc[0]['method']}")
+    sclc_row = rank_summary_df[rank_summary_df["method"] == "sclc_pcc_only"]
+    if len(sclc_row):
+        print(f"  sclc_pcc_only mean rank: {sclc_row.iloc[0]['mean_panel_rank']:.1f}")
 
     best_per_panel = (
         eval_df.dropna(subset=["expected_partner_rank"])
@@ -778,29 +749,24 @@ def main() -> None:
     best_csv = os.path.join(RESULTS_DIR, "best_method_per_panel.csv")
     best_per_panel.to_csv(best_csv, index=False)
 
-    default_tag = jst_method_tag(DEFAULT_JST_GAMMA)
-    fi_default = fi_by_gamma[default_tag] if default_tag in fi_by_gamma else list(fi_by_gamma.values())[-1]
-    build_top_pair_per_ko(fi_default).to_csv(
-        os.path.join(RESULTS_DIR, "top_pairs_jst_default.csv"), index=False
-    )
-    fi_default.to_pickle(os.path.join(RESULTS_DIR, f"fi_{default_tag}.pkl"))
+    default_tag = method_tag(DEFAULT_JST_GAMMA, DEFAULT_LAM1, DEFAULT_LAM2)
+    fi_default = fi_by_tag.get(default_tag)
+    if fi_default is not None:
+        build_top_pair_per_ko(fi_default).to_csv(
+            os.path.join(RESULTS_DIR, "top_pairs_jst_dual_default.csv"), index=False
+        )
+        fi_default.to_pickle(os.path.join(RESULTS_DIR, f"fi_{default_tag}.pkl"))
 
-    xlsx = os.path.join(RESULTS_DIR, "sli_jst_summary.xlsx")
+    xlsx = os.path.join(RESULTS_DIR, "sli_jst_pcc_dual_summary.xlsx")
     with pd.ExcelWriter(xlsx, engine="openpyxl") as writer:
         eval_df.to_excel(writer, sheet_name="PanelRankComparison", index=False)
         best_per_panel.to_excel(writer, sheet_name="BestMethodPerPanel", index=False)
         rank_summary_df.to_excel(writer, sheet_name="MeanPanelRank", index=False)
-        build_top_pair_per_ko(fi_default).head(200).to_excel(
-            writer, sheet_name="TopPairsJST", index=False
-        )
 
     print("\nDone.")
     print(f"  {eval_csv}")
     print(f"  {best_csv}")
     print(f"  {xlsx}")
-    print(f"\nPrimary method: JST-SLRFM (joint KRR + KMM + pan-prior)")
-    print(f"  Default gamma={DEFAULT_JST_GAMMA}; sweep={JST_GAMMA_SWEEP}")
-    print("  Set JST_COMPUTE_ALL_KOS=True for genome-wide FI.")
 
 
 if __name__ == "__main__":

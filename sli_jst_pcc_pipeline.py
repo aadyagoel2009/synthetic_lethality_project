@@ -57,7 +57,12 @@ KMM_TARGET_SCLC_FRAC = 1.0
 JST_GAMMA_SWEEP: List[float] = [0.01, 0.1, 1.0, 10.0]
 DEFAULT_JST_GAMMA = 10.0
 
-JST_PCC_LAMBDA_SWEEP: List[float] = [0.0, 0.01, 0.1, 0.5, 1.0, 2.0, 5.0]
+JST_PCC_LAMBDA_SWEEP: List[float] = [0.0,
+                                0.01, 0.05, 0.1,
+                                0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45,
+                                0.5, 0.6, 0.75,
+                                1.0,
+                            ]
 DEFAULT_JST_PCC_LAMBDA = 0.1
 
 COMPUTE_ALL_KOS = False
