@@ -167,3 +167,9 @@ cython_debug/
 //datasets/feature_importances_pan_data.npy
 .DS_Store
 **/.DS_Store
+
+# Oversized files kept locally only
+/sli_pooled_results/fi_weighted_w10.pkl
+/sli_pooled_results/fi_pan.pkl
+/datasets/feature_importances_pan_data.npy
+/sli_transfer_results/fi_pan.pkl
