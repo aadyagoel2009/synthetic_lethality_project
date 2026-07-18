@@ -9,7 +9,7 @@ Mutation features (all other feature columns):
 
 Merge (per KO column):
   percentile rank within mut features + percentile rank within exp features
-  -> single sorted list (mut and exp compete on [0, 1] percentiles)
+  -> single sorted list (mut and exp cogit mpete on [0, 1] percentiles)
 
 Same global (gamma, lambda) for all panels; no per-subtype method switching.
 
