@@ -1,23 +1,24 @@
 """
 Genome-wide top-10 SLI predictions using split_g10_lam0.05.
 
-For every CRISPR knockout gene:
-  1. Score expression features with SCLC JST-PCC (gamma=10, lambda=0.05).
-  2. Score mutation features with the pan-cancer SL-RFM feature importance.
-  3. Merge expression and mutation rankings using within-type percentiles.
-  4. Convert features to partner genes while retaining exp/mut evidence.
-  5. Calculate an elbow cutoff from one score per KO: the score of that
-     KO's top partner.
-  6. Export up to 10 distinct partner genes per KO whose scores pass the
-     calculated elbow cutoff.
+Follows the original SL-RFM paper scoring steps from generate_figures.ipynb:
+  score(k) = max(v_k) - mean(v_k)
 
-KO and candidate scores:
-  top_ko_score(k)       = max(v_k) - mean(v_k)
-  candidate_score(f, k) = v[f, k] - mean(v_k)
+where v is the feature-importance matrix (NOT percentile ranks).
 
-The elbow is calculated only from the distribution of top_ko_score values.
-It is then applied to candidate_score values, retaining at most 10 distinct
-partner genes per KO. Here, v is the final split-model percentile score.
+For the split method, v is built from the raw channel scores:
+  - expression features: SCLC JST-PCC (gamma=10, lambda=0.05)
+  - mutation features:   pan SL-RFM feature importance
+
+Then:
+  1. For the elbow only, compute one score per KO from its top feature:
+       top_ko_score(k) = max(v_k) - mean(v_k)
+  2. Calculate an elbow cutoff from those top-KO scores.
+  3. Export up to 10 distinct partner genes per KO. Each candidate keeps
+     its own score:
+       candidate_score(f, k) = v[f, k] - mean(v_k)
+     so the 3rd-best pair uses the 3rd-best feature's value minus the mean,
+     not the top-1 value. Keep candidates with candidate_score >= elbow.
 
 Run:
   python sli_jst_pcc_split_top10_predictions.py
@@ -99,6 +100,33 @@ def calculate_elbow_score(top_ko_scores: pd.Series) -> float:
     return float(values[elbow_index])
 
 
+def build_importance_matrix(
+    exp_channel: pd.DataFrame,
+    mut_channel: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Build the paper-style feature-importance matrix v for the split method.
+
+    Expression features keep their JST-PCC scores; mutation features keep their
+    pan SL-RFM scores. This is the matrix that max(v)-mean(v) should be applied
+    to -- not the within-type percentile merge used only for panel ranking.
+    """
+    common_idx = exp_channel.index.intersection(mut_channel.index)
+    common_cols = exp_channel.columns.intersection(mut_channel.columns)
+    exp_idx, mut_idx = split.split_feature_index(common_idx)
+
+    v = pd.DataFrame(0.0, index=common_idx, columns=common_cols, dtype=float)
+    if exp_idx:
+        v.loc[exp_idx, common_cols] = (
+            exp_channel.loc[exp_idx, common_cols].astype(float).values
+        )
+    if mut_idx:
+        v.loc[mut_idx, common_cols] = (
+            mut_channel.loc[mut_idx, common_cols].astype(float).values
+        )
+    return v.fillna(0.0)
+
+
 def load_pan_fi_for_all_kos(
     pan_embedding: pd.DataFrame,
     pan_effects: pd.DataFrame,
@@ -160,23 +188,34 @@ def load_or_compute_structure(
 
 
 def build_top10_predictions(
-    merged_scores: pd.DataFrame,
-    exp_channel: pd.DataFrame,
-    mut_channel: pd.DataFrame,
+    importance: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Calculate the top-KO elbow and return up to 10 partner genes per KO.
+    Elbow uses only the top feature per KO (paper):
+      top_ko_score(k) = max(v_k) - mean(v_k)
 
-    Multiple feature types for one partner gene are not emitted twice. The
-    higher-ranked feature is retained and its exp/mut type remains explicit.
+    Each exported candidate uses that candidate's own importance:
+      ko_score(f, k) = v[f, k] - mean(v_k)
+    e.g. rank-3 row uses the 3rd-best feature minus the KO mean.
     """
-    scores_by_ko: dict[str, pd.Series] = {}
-    mean_by_ko: dict[str, float] = {}
-    top_ko_scores: dict[str, float] = {}
+    # Paper (generate_figures.ipynb):
+    #   top_deviations = feature_importances.max() - feature_importances.mean()
+    # Apply this to raw importances only -- never to percentile ranks.
+    # Used solely to set the elbow cutoff.
+    top_ko_scores = importance.max(axis=0) - importance.mean(axis=0)
+    top_ko_scores = top_ko_scores.replace([np.inf, -np.inf], np.nan).dropna()
+    if top_ko_scores.nunique(dropna=True) <= 1:
+        raise ValueError(
+            "All KO scores are identical after max(v)-mean(v). This usually "
+            "means v was percentile-ranked instead of raw feature importance."
+        )
+    elbow_score = calculate_elbow_score(top_ko_scores)
 
-    for ko_gene in merged_scores.columns:
+    prediction_rows: List[dict] = []
+
+    for ko_gene in top_ko_scores.index:
         scores = (
-            merged_scores[ko_gene]
+            importance[ko_gene]
             .replace([np.inf, -np.inf], np.nan)
             .dropna()
             .sort_values(ascending=False)
@@ -184,40 +223,26 @@ def build_top10_predictions(
         if scores.empty:
             continue
 
-        ko_key = str(ko_gene)
         mean_score = float(scores.mean())
-        scores_by_ko[ko_key] = scores
-        mean_by_ko[ko_key] = mean_score
-        top_ko_scores[ko_key] = float(scores.iloc[0] - mean_score)
-
-    top_ko_score_series = pd.Series(top_ko_scores, name="top_ko_score")
-    elbow_score = calculate_elbow_score(top_ko_score_series)
-
-    prediction_rows: List[dict] = []
-
-    for ko_gene, scores in scores_by_ko.items():
-        mean_score = mean_by_ko[ko_gene]
         kept = 0
         seen_genes: set[str] = set()
 
-        for feature, score in scores.items():
+        for feature, value in scores.items():
             feature_str = str(feature)
             gene = partner_gene(feature_str)
             if gene in seen_genes:
                 continue
             seen_genes.add(gene)
 
-            candidate_deviation = float(score - mean_score)
-            if candidate_deviation < elbow_score:
-                # Scores are descending, so later candidates cannot pass.
+            # This candidate's own score: v[this feature] - mean(v_k),
+            # not max(v_k) - mean(v_k).
+            candidate_score = float(value - mean_score)
+            if candidate_score < elbow_score:
+                # Sorted by v descending, so later candidates cannot pass.
                 break
 
             if kept >= TOP_K_GENES:
                 break
-
-            ftype = feature_type(feature_str)
-            channel = exp_channel if ftype == "exp" else mut_channel
-            raw_channel_score = float(channel.at[feature, ko_gene])
 
             kept += 1
             prediction_rows.append(
@@ -225,12 +250,11 @@ def build_top10_predictions(
                     "ko_gene": str(ko_gene),
                     "rank_in_ko": kept,
                     "partner_gene": gene,
-                    "ko_score": candidate_deviation,
+                    "ko_score": candidate_score,
                     "feature": feature_str,
-                    "feature_type": ftype,
-                    "merged_percentile_score": float(score),
-                    "mean_ko_score": mean_score,
-                    "raw_channel_score": raw_channel_score,
+                    "feature_type": feature_type(feature_str),
+                    "feature_importance": float(value),
+                    "mean_ko_importance": mean_score,
                     "method": METHOD,
                 }
             )
@@ -328,26 +352,19 @@ def main() -> None:
         device,
     )
 
-    print("\n=== split_g10_lam0.05 score ===")
+    print("\n=== split_g10_lam0.05 feature importances ===")
     exp_channel = split.compute_exp_jst_pcc_scores(
         pcc_sclc,
         structure,
         LAMBDA,
     )
-    merged_scores = split.merge_type_split_scores(
-        exp_channel,
-        mut_channel,
-    )
+    importance = build_importance_matrix(exp_channel, mut_channel)
     print(
-        f"Merged score matrix: {merged_scores.shape[0]} features x "
-        f"{merged_scores.shape[1]} KOs"
+        f"Importance matrix v: {importance.shape[0]} features x "
+        f"{importance.shape[1]} KOs"
     )
 
-    predictions, elbow_result = build_top10_predictions(
-        merged_scores,
-        exp_channel,
-        mut_channel,
-    )
+    predictions, elbow_result = build_top10_predictions(importance)
 
     predictions.to_csv(OUTPUT_CSV, index=False)
     elbow_result.to_csv(OUTPUT_ELBOW_CSV, index=False)
@@ -357,14 +374,20 @@ def main() -> None:
         predictions.to_excel(writer, sheet_name="SLIPredictions", index=False)
 
     if SAVE_FULL_SCORE_MATRIX:
-        merged_scores.to_pickle(FULL_SCORE_CACHE)
+        importance.to_pickle(FULL_SCORE_CACHE)
 
     elbow_score = float(elbow_result.at[0, "elbow_score"])
     n_kos = int(predictions["ko_gene"].nunique()) if not predictions.empty else 0
     print("\nDone.")
     print(f"  Calculated elbow score: {elbow_score:.12g}")
-    print(f"  KOs with exported candidates: {n_kos}/{merged_scores.shape[1]}")
+    print(f"  KOs with exported candidates: {n_kos}/{importance.shape[1]}")
     print(f"  Exported candidate rows: {len(predictions)}")
+    if not predictions.empty:
+        print(
+            f"  ko_score range: "
+            f"{predictions['ko_score'].min():.6g} .. "
+            f"{predictions['ko_score'].max():.6g}"
+        )
     print(f"  {OUTPUT_CSV}")
     print(f"  {OUTPUT_ELBOW_CSV}")
     print(f"  {OUTPUT_XLSX}")
